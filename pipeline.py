@@ -31,7 +31,7 @@ from datetime import datetime
 # 配置
 # ============================================================
 ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
-ARK_API_KEY = os.environ.get("ARK_API_KEY", "d423fa6a-53e3-4159-8590-ec9fbc5171ca")
+ARK_API_KEY = os.environ["ARK_API_KEY"]
 
 SEEDREAM_5 = "doubao-seedream-5-0-260128"
 SEEDANCE_15_PRO = "doubao-seedance-1-5-pro-251215"   # 4~12s/段, 已验证可用

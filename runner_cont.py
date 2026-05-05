@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Continue from segment 2 using last_frame from segment 1"""
-import json, time, requests, sys
+import json, time, requests, sys, os
 from pathlib import Path
 
-ARK_KEY = "d423fa6a-53e3-4159-8590-ec9fbc5171ca"
+ARK_KEY = os.environ["ARK_API_KEY"]
 HEADERS = {"Authorization": f"Bearer {ARK_KEY}", "Content-Type": "application/json"}
 MODEL = "doubao-seedance-1-5-pro-251215"
 OUT = Path("/home/administrator/videopipe/output")

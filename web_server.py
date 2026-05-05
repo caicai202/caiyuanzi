@@ -43,7 +43,7 @@ def _download_tos_with_retry(url, seg_label, max_retries=3, base_timeout=120):
 # ============================================================
 # 配置
 # ============================================================
-ARK_API_KEY = os.environ.get("ARK_API_KEY", "d423fa6a-53e3-4159-8590-ec9fbc5171ca")
+ARK_API_KEY = os.environ["ARK_API_KEY"]
 ARK_BASE = "https://ark.cn-beijing.volces.com/api/v3"
 HEADERS = {"Authorization": f"Bearer {ARK_API_KEY}", "Content-Type": "application/json"}
 
