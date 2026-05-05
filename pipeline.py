@@ -61,7 +61,7 @@ def generate_portrait(prompt: str, size: str = "1080x1920", n: int = 1) -> list[
     返回图片 URL 列表。
     """
     print(f"\n{'='*60}")
-    print(f"📸 阶段1: Seedream 5.0 生成定妆照")
+    print("📸 阶段1: Seedream 5.0 生成定妆照")
     print(f"   Prompt: {prompt[:80]}...")
     print(f"   Size: {size}")
 
@@ -486,7 +486,7 @@ def main():
         sys.exit(1)
 
     print(f"\n{'#'*60}")
-    print(f"# 火山引擎 ARK → 口播成片管道")
+    print("# 火山引擎 ARK → 口播成片管道")
     print(f"# Session: {SESSION_ID}")
     print(f"# 剧本长度: {len(script_text)} 字")
     print(f"# 每段时长: {args.duration}s")
@@ -529,7 +529,7 @@ def main():
         for seg, tseg in zip(segments, text_segments):
             seg["prompt"] = f"{style_preview}{tseg['text']}"
 
-        print(f"\n   ⚡ 切换 Seedance 为无声模式 (generate_audio=False)")
+        print("\n   ⚡ 切换 Seedance 为无声模式 (generate_audio=False)")
 
     est_total = sum(seg.get("duration", args.duration) for seg in segments)
     print(f"\n   预估总时长: {est_total}s = {est_total/60:.1f}分钟")
@@ -546,7 +546,7 @@ def main():
     global SEEDANCE_MODEL
     if args.model == "2.0":
         SEEDANCE_MODEL = SEEDANCE_2
-        print(f"\n⚠️ 使用 Seedance 2.0 (需确保控制台已开通!)")
+        print("\n⚠️ 使用 Seedance 2.0 (需确保控制台已开通!)")
     else:
         SEEDANCE_MODEL = SEEDANCE_15_PRO
         # 如果用户没手动指定 duration, 提醒 1.5 Pro 上限
@@ -600,7 +600,7 @@ def main():
 
     # 总结
     print(f"\n{'='*60}")
-    print(f"🎉 管道完成!")
+    print("🎉 管道完成!")
     print(f"   定妆照: {portrait_paths[0] if portrait_paths else 'N/A'}")
     print(f"   视频段: {len(video_paths)} 段")
     print(f"   成片:   {final_path}")

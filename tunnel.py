@@ -4,7 +4,12 @@
 用法: python3 tunnel.py
 输出: 写入 ~/videopipe/.tunnel_url 文件
 """
-import subprocess, re, time, sys, os, atexit
+import subprocess
+import re
+import time
+import sys
+import os
+import atexit
 
 TUNNEL_FILE = os.path.expanduser("~/videopipe/.tunnel_url")
 
@@ -12,7 +17,7 @@ def main():
     proc = subprocess.Popen(
         ['ssh', '-o', 'StrictHostKeyChecking=no',
          '-o', 'ServerAliveInterval=30',
-         '-R', f'80:localhost:5000', 'serveo.net'],
+         '-R', '80:localhost:5000', 'serveo.net'],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
     )
     atexit.register(lambda: proc.terminate())

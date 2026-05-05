@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Run segments 2-7 with file-based logging"""
-import json, time, requests, sys, os
+import json
+import time
+import requests
+import os
 from pathlib import Path
 
 ARK_KEY = os.environ["ARK_API_KEY"]
@@ -20,7 +23,7 @@ with open("/home/administrator/videopipe/segments.json") as f:
 
 SEG2_TASK = "cgt-20260502204839-b8zsp"
 
-log(f"=== Starting from segment 2 ===")
+log("=== Starting from segment 2 ===")
 
 def poll_and_download(task_id, seg_num):
     log(f"Seg{seg_num}: polling {task_id}")
@@ -46,7 +49,7 @@ def poll_and_download(task_id, seg_num):
             log(f"Seg{seg_num} [{elapsed}s] {st}")
         time.sleep(15)
 
-def create_task(seg, ref_url):
+def create_task(seg, ref_url, seg_num):
     payload = {
         "model": MODEL,
         "content": [
@@ -69,7 +72,7 @@ for i in range(2, 7):
     seg = ALL_SEGMENTS[i]
     n = i + 1
     log(f"--- Seg {n}/7 ({seg['duration']}s) ---")
-    tid = create_task(seg, lf)
+    tid = create_task(seg, lf, n)
     log(f"Seg{n} task: {tid}")
     lf = poll_and_download(tid, n)
 

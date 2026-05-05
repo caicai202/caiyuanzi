@@ -3,7 +3,14 @@
 koubo Web 控制台 — Flask 后端
 提供 REST API + SSE 实时进度推送
 """
-import os, sys, json, re, time, uuid, threading, queue, subprocess
+import os
+import sys
+import json
+import re
+import time
+import threading
+import queue
+import subprocess
 from pathlib import Path
 from datetime import datetime
 from flask import Flask, request, jsonify, Response, send_file, render_template_string
@@ -359,7 +366,7 @@ class KouboPipeline:
                         if tts_path and os.path.exists(tts_path):
                             merged = vpath.with_suffix(".merged.mp4")
                             merge_video_audio(str(vpath), tts_path, str(merged))
-                            self.log(f"   🔊 合并 TTS 音频完成")
+                            self.log("   🔊 合并 TTS 音频完成")
                             vpath = merged
                             video_paths[idx] = str(vpath)
 
@@ -769,7 +776,7 @@ def api_test_connection():
         elif r.status_code == 401:
             return jsonify({"ok": False, "error": "API Key 无效（401 认证失败），请检查 Key 是否正确或已过期"})
         elif r.status_code == 403:
-            return jsonify({"ok": False, "error": f"API 拒绝访问（403），请检查权限"})
+            return jsonify({"ok": False, "error": "API 拒绝访问（403），请检查权限"})
         elif r.status_code == 404:
             return jsonify({"ok": False, "error": f"API 地址错误（404），请确认地址为 https://ark.cn-beijing.volces.com/api/v3，当前填的是: {api_base}"})
         else:
@@ -904,7 +911,6 @@ def api_describe_portrait():
 @app.route("/api/history")
 def api_history():
     """获取生成历史列表"""
-    import glob
     session_dirs = sorted(OUTPUT_DIR.glob("20*"), reverse=True)
     results = []
     for d in session_dirs[:50]:  # 最多50条
@@ -1135,7 +1141,7 @@ def api_design_actions():
         
         if result is None:
             return jsonify({
-                "error": f"JSON 解析失败（已尝试多种回退策略）",
+                "error": "JSON 解析失败（已尝试多种回退策略）",
                 "raw": content[:800],
                 "parse_errors": parse_errors[-3:],
             }), 500
@@ -1268,7 +1274,6 @@ def api_portraits():
     project_characters = {}
     projects_dir = OUTPUT_DIR / "projects"
     if projects_dir.exists():
-        import glob
         for pf in sorted(projects_dir.glob("*.json"), reverse=True):
             try:
                 pdata = json.loads(pf.read_text())
@@ -1332,7 +1337,6 @@ def api_tunnel_restart():
     tunnel_url_file.unlink(missing_ok=True)
     
     # 3. 启动新隧道
-    import shutil
     tunnel_script = OUTPUT_DIR.parent / "tunnel.py"
     if not tunnel_script.exists():
         return jsonify({"error": "tunnel.py 不存在"}), 500
@@ -3311,6 +3315,6 @@ setInterval(refreshTunnelStatus, 30000);
 
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
-    print(f"\n🎬 koubo Web 控制台")
+    print("\n🎬 koubo Web 控制台")
     print(f"   http://localhost:{port}\n")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)

@@ -10,13 +10,10 @@
 """
 
 import os
-import re
 import json
 import asyncio
 import subprocess
-import tempfile
-from pathlib import Path
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass
 
 
 @dataclass
@@ -152,8 +149,8 @@ def tts_pipeline(
     """
     print(f"\n{'='*60}")
     print(f"🎙️ 外部 TTS: Microsoft Edge ({voice})")
-    print(f"   模式: TTS 先行 → Seedance 无声 → ffmpeg 合并")
-    print(f"   优势: 多段音色 100% 一致, 完美对口型")
+    print("   模式: TTS 先行 → Seedance 无声 → ffmpeg 合并")
+    print("   优势: 多段音色 100% 一致, 完美对口型")
 
     # 1. 生成 TTS
     tts_results = generate_segment_tts(segments, output_dir, voice)
