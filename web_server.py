@@ -15,50 +15,21 @@ from pathlib import Path
 from datetime import datetime
 from flask import Flask, request, jsonify, Response, send_file, render_template_string
 from flask_cors import CORS
-import requests
 import urllib3
+
+from ark_client import (
+    ARK_API_KEY, ARK_BASE_URL, get_headers, api_session,
+    SEEDREAM_MODEL, SEEDANCE_15_PRO, SEEDANCE_2,
+    OUTPUT_DIR,
+    download_with_retry,
+)
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ====== 绕过代理：火山引擎 TOS + 本地 API 不走代理 ======
-def _create_session():
-    """创建 bypass 代理的 requests Session"""
-    s = requests.Session()
-    s.trust_env = False  # 忽略系统代理
-    return s
-
-# 所有对外 API 调用使用此 session
-api_session = _create_session()
-
-def _download_tos_with_retry(url, seg_label, max_retries=3, base_timeout=120):
-    """下载 TOS 视频/图片，带重试机制防止瞬时网络故障"""
-    import time as _time
-    last_error = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            resp = api_session.get(url, timeout=base_timeout)
-            resp.raise_for_status()
-            return resp.content
-        except Exception as e:
-            last_error = e
-            if attempt < max_retries:
-                wait = 2 ** attempt  # 2s, 4s, 8s
-                print(f"  ⚠️ 段{seg_label} 下载失败 (尝试 {attempt}/{max_retries}): {e}")
-                print(f"     {wait}s 后重试...")
-                _time.sleep(wait)
-    raise RuntimeError(f"段{seg_label} 下载失败（{max_retries}次重试后）: {last_error}")
-
-# ============================================================
-# 配置
-# ============================================================
-ARK_API_KEY = os.environ["ARK_API_KEY"]
-ARK_BASE = "https://ark.cn-beijing.volces.com/api/v3"
-HEADERS = {"Authorization": f"Bearer {ARK_API_KEY}", "Content-Type": "application/json"}
-
-SEEDREAM_MODEL = "doubao-seedream-5-0-260128"
-SEEDANCE_MODEL = "doubao-seedance-1-5-pro-251215"
-
-OUTPUT_DIR = Path(__file__).parent / "output"
-OUTPUT_DIR.mkdir(exist_ok=True)
+# 所有对外 API 调用使用此 session（已在 ark_client 中配置 bypass 代理）
+HEADERS = get_headers()
+ARK_BASE = ARK_BASE_URL
+SEEDANCE_MODEL = SEEDANCE_15_PRO
 
 app = Flask(__name__)
 CORS(app)
@@ -124,7 +95,7 @@ class KouboPipeline:
             # 外部公网 URL → 直接下载使用
             self.emit("stage", {"stage": "portrait", "step": 1, "total": 3, "label": "🎨 使用已有定妆照"})
             self.log("使用外部定妆照 URL")
-            portrait_data = _download_tos_with_retry(portrait_url, "定妆照", max_retries=3, base_timeout=60)
+            portrait_data = download_with_retry(portrait_url, "定妆照", max_retries=3, timeout=60)
             portrait_path = self.session_dir / "portrait.png"
             portrait_path.write_bytes(portrait_data)
             self.log(f"✅ 下载照片完成 ({len(portrait_data)//1024}KB)")
@@ -221,7 +192,7 @@ class KouboPipeline:
                 raise RuntimeError(f"定妆照失败 HTTP {resp.status_code}: {resp.text[:300]}")
 
             portrait_url = resp.json()["data"][0]["url"]
-            portrait_data = _download_tos_with_retry(portrait_url, "定妆照", max_retries=3, base_timeout=60)
+            portrait_data = download_with_retry(portrait_url, "定妆照", max_retries=3, timeout=60)
             portrait_path = self.session_dir / "portrait.png"
             portrait_path.write_bytes(portrait_data)
             self.log(f"✅ 定妆照完成 ({len(portrait_data)//1024}KB)")
@@ -344,7 +315,7 @@ class KouboPipeline:
 
                     # 下载（带重试，防止瞬时网络故障）
                     vpath = self.session_dir / f"seg{seg_num:02d}.mp4"
-                    video_data = _download_tos_with_retry(vu, seg_num)
+                    video_data = download_with_retry(vu, seg_num)
                     vpath.write_bytes(video_data)
                     seg_size = vpath.stat().st_size // 1024
                     self.log(f"✅ 段{seg_num} 完成 ({elapsed}s, {seg_size}KB)")
@@ -733,7 +704,7 @@ def api_preview_portrait():
             return jsonify({"error": f"Seedream 失败 HTTP {resp.status_code}: {resp.text[:200]}"}), 500
         
         portrait_url = resp.json()["data"][0]["url"]
-        portrait_data = _download_tos_with_retry(portrait_url, "定妆照", max_retries=3, base_timeout=60)
+        portrait_data = download_with_retry(portrait_url, "定妆照", max_retries=3, timeout=60)
         
         # 保存到 output/preview/ 目录
         preview_dir = OUTPUT_DIR / "previews"

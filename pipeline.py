@@ -23,79 +23,38 @@ import json
 import time
 import argparse
 import subprocess
-import requests
 from pathlib import Path
 from datetime import datetime
 
-# ============================================================
-# 配置
-# ============================================================
-ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
-ARK_API_KEY = os.environ["ARK_API_KEY"]
-
-SEEDREAM_5 = "doubao-seedream-5-0-260128"
-SEEDANCE_15_PRO = "doubao-seedance-1-5-pro-251215"   # 4~12s/段, 已验证可用
-SEEDANCE_2 = "doubao-seedance-2-0-260128"             # 4~15s/段, 需开通
+from ark_client import (
+    ARK_BASE_URL, ARK_API_KEY, get_headers, api_session,
+    SEEDREAM_MODEL, SEEDANCE_15_PRO, SEEDANCE_2,
+    OUTPUT_DIR,
+    generate_portrait, create_video_task, query_task, wait_for_task,
+    download_with_retry,
+)
 
 # 默认配置
-SEEDREAM_MODEL = SEEDREAM_5
-SEEDANCE_MODEL = SEEDANCE_15_PRO  # 默认 1.5 Pro, 用 --model seedance2 切换
-
-OUTPUT_DIR = Path(__file__).parent / "output"
-OUTPUT_DIR.mkdir(exist_ok=True)
-
-HEADERS = {
-    "Authorization": f"Bearer {ARK_API_KEY}",
-    "Content-Type": "application/json",
-}
+SEEDANCE_MODEL = SEEDANCE_15_PRO  # 默认 1.5 Pro
 
 SESSION_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
 # ============================================================
-# 阶段1: Seedream 5.0 生成定妆照
+# 阶段1: Seedream 5.0 生成定妆照（封装 ark_client）
 # ============================================================
-def generate_portrait(prompt: str, size: str = "1080x1920", n: int = 1) -> list[str]:
-    """
-    调用 Seedream 5.0 生成定妆照。
-    返回图片 URL 列表。
-    """
+def generate_portrait_local(prompt: str, size: str = "1080x1920", n: int = 1):
+    """调用 ark_client 并保存到带 session_id 的路径。"""
     print(f"\n{'='*60}")
     print("📸 阶段1: Seedream 5.0 生成定妆照")
     print(f"   Prompt: {prompt[:80]}...")
     print(f"   Size: {size}")
 
-    payload = {
-        "model": SEEDREAM_MODEL,
-        "prompt": prompt,
-        "size": size,
-        "n": n,
-        "output_format": "png",
-    }
+    urls, _ = generate_portrait(prompt, size=size, n=n)
 
-    resp = requests.post(
-        f"{ARK_BASE_URL}/images/generations",
-        headers=HEADERS,
-        json=payload,
-        timeout=120,
-    )
-
-    if resp.status_code != 200:
-        print(f"   ❌ 失败: HTTP {resp.status_code}")
-        print(f"   {resp.text[:500]}")
-        sys.exit(1)
-
-    data = resp.json()
-    urls = [img["url"] for img in data.get("data", [])]
-
-    if not urls:
-        print("   ❌ 未返回图片 URL")
-        sys.exit(1)
-
-    # 下载保存
     saved = []
     for i, url in enumerate(urls):
-        img_data = requests.get(url, timeout=30).content
+        img_data = api_session.get(url, timeout=30).content
         path = OUTPUT_DIR / f"{SESSION_ID}_portrait_{i}.png"
         path.write_bytes(img_data)
         saved.append(str(path))
@@ -105,89 +64,9 @@ def generate_portrait(prompt: str, size: str = "1080x1920", n: int = 1) -> list[
 
 
 # ============================================================
-# 阶段2: Seedance 2.0 分段生成视频 (尾帧接力)
+# 阶段2: Seedance 分段生成视频 (尾帧接力)
 # ============================================================
-def create_video_task(
-    model: str,
-    content: list,
-    duration: int = 15,
-    resolution: str = "720p",
-    ratio: str = "9:16",
-    generate_audio: bool = True,
-    return_last_frame: bool = True,
-    seed: int = -1,
-) -> dict:
-    """创建视频生成任务，返回任务信息。"""
-    payload = {
-        "model": model,
-        "content": content,
-        "duration": duration,
-        "resolution": resolution,
-        "ratio": ratio,
-        "generate_audio": generate_audio,
-        "return_last_frame": return_last_frame,
-        "seed": seed,
-    }
-
-    resp = requests.post(
-        f"{ARK_BASE_URL}/contents/generations/tasks",
-        headers=HEADERS,
-        json=payload,
-        timeout=60,
-    )
-
-    if resp.status_code != 200:
-        raise RuntimeError(f"创建任务失败 HTTP {resp.status_code}: {resp.text[:500]}")
-
-    return resp.json()
-
-
-def query_task(task_id: str) -> dict:
-    """查询视频生成任务状态。"""
-    resp = requests.get(
-        f"{ARK_BASE_URL}/contents/generations/tasks/{task_id}",
-        headers=HEADERS,
-        timeout=30,
-    )
-    if resp.status_code != 200:
-        raise RuntimeError(f"查询任务失败: {resp.text[:300]}")
-    return resp.json()
-
-
-def wait_for_task(task_id: str, poll_interval: int = 20, max_wait: int = 900) -> dict:
-    """轮询等待任务完成。"""
-    print(f"   任务 ID: {task_id}")
-    start = time.time()
-    last_status = ""
-
-    while time.time() - start < max_wait:
-        result = query_task(task_id)
-        status = result.get("status", "unknown")
-
-        if status != last_status:
-            elapsed = int(time.time() - start)
-            print(f"   [{elapsed}s] 状态: {status}")
-            last_status = status
-
-        if status == "succeeded":
-            return result
-        elif status == "failed":
-            error = result.get("error", {})
-            raise RuntimeError(f"任务失败: {error}")
-        elif status == "expired":
-            raise RuntimeError("任务超时过期")
-
-        time.sleep(poll_interval)
-
-    raise TimeoutError(f"任务超时 ({max_wait}s): 最后状态 {last_status}")
-
-
-def download_file(url: str, local_path: str) -> str:
-    """下载文件到本地。"""
-    resp = requests.get(url, timeout=120)
-    resp.raise_for_status()
-    Path(local_path).write_bytes(resp.content)
-    return local_path
+# 使用 ark_client.create_video_task / query_task / wait_for_task
 
 
 def generate_segments(
@@ -264,14 +143,16 @@ def generate_segments(
 
         # 下载视频
         video_path = str(OUTPUT_DIR / f"{SESSION_ID}_seg{seg_num:02d}.mp4")
-        download_file(video_url, video_path)
-        print(f"   已保存: {video_path} ({Path(video_path).stat().st_size // 1024}KB)")
+        video_data = download_with_retry(video_url, f"seg{seg_num}")
+        Path(video_path).write_bytes(video_data)
+        print(f"   已保存: {video_path} ({len(video_data) // 1024}KB)")
 
         # 下载尾帧
         last_frame_path = None
         if last_frame_url:
             last_frame_path = str(OUTPUT_DIR / f"{SESSION_ID}_lastframe{seg_num:02d}.png")
-            download_file(last_frame_url, last_frame_path)
+            last_frame_data = download_with_retry(last_frame_url, f"lastframe_seg{seg_num}")
+            Path(last_frame_path).write_bytes(last_frame_data)
 
         results.append({
             "seg_num": seg_num,
@@ -568,7 +449,7 @@ def main():
             f"柔和自然光，干净纯色背景。"
             f"高分辨率，皮肤细节清晰，眼神自然看向镜头。"
         )
-        portrait_urls, portrait_paths = generate_portrait(full_prompt, args.portrait_size)
+        portrait_urls, portrait_paths = generate_portrait_local(full_prompt, args.portrait_size)
 
     # 阶段2: 分段生成视频
     video_results = generate_segments(
