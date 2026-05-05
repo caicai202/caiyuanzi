@@ -19,8 +19,7 @@ import urllib3
 
 from ark_client import (
     ARK_API_KEY, ARK_BASE_URL, get_headers, api_session,
-    SEEDREAM_MODEL, SEEDANCE_15_PRO, SEEDANCE_2,
-    OUTPUT_DIR,
+    SEEDREAM_MODEL, SEEDANCE_15_PRO, OUTPUT_DIR,
     download_with_retry,
 )
 

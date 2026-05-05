@@ -20,17 +20,16 @@
 import os
 import sys
 import json
-import time
 import argparse
 import subprocess
 from pathlib import Path
 from datetime import datetime
 
 from ark_client import (
-    ARK_BASE_URL, ARK_API_KEY, get_headers, api_session,
+    api_session,
     SEEDREAM_MODEL, SEEDANCE_15_PRO, SEEDANCE_2,
     OUTPUT_DIR,
-    generate_portrait, create_video_task, query_task, wait_for_task,
+    generate_portrait, create_video_task, wait_for_task,
     download_with_retry,
 )
 
