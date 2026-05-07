@@ -5,6 +5,13 @@ koubo Web 控制台 — Flask 后端
 """
 import os
 import sys
+import io
+
+# Windows 控制台 UTF-8 编码修复
+if sys.platform == "win32":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+
 import json
 import re
 import time
@@ -21,9 +28,37 @@ from ark_client import (
     ARK_API_KEY, ARK_BASE_URL, get_headers, api_session,
     SEEDREAM_MODEL, SEEDANCE_15_PRO, OUTPUT_DIR,
     download_with_retry,
+    generate_portrait_raw, wait_for_task_with_progress,
+    concat_videos,
 )
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ============================================================
+# SSRF 防护：禁止请求内网地址
+# ============================================================
+import ipaddress
+from urllib.parse import urlparse
+import socket
+
+_SAFE_HOSTS = {"ark.cn-beijing.volces.com", "api.deepseek.com"}
+
+def _is_safe_url(url: str) -> bool:
+    """检查 URL 是否安全（非内网地址或已列入白名单）"""
+    try:
+        hostname = urlparse(url).hostname
+        if not hostname:
+            return False
+        if hostname in _SAFE_HOSTS:
+            return True
+        addr = ipaddress.ip_address(hostname)
+        return not (addr.is_private or addr.is_loopback or addr.is_link_local)
+    except ValueError:
+        # hostname 不是 IP，尝试 DNS 解析
+        pass
+    except Exception:
+        return False
+    return True
 
 # 所有对外 API 调用使用此 session（已在 ark_client 中配置 bypass 代理）
 HEADERS = get_headers()
@@ -33,9 +68,64 @@ SEEDANCE_MODEL = SEEDANCE_15_PRO
 app = Flask(__name__)
 CORS(app)
 
+# ============================================================
+# API 鉴权
+# ============================================================
+ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", "")
+if not ACCESS_TOKEN:
+    print("⚠️  未设置 ACCESS_TOKEN，API 无需鉴权。建议在 .env 中设置以保护 API。", file=sys.stderr)
+
+
+def _check_auth():
+    """验证请求是否携带有效 token。未配置 token 时跳过验证。"""
+    if not ACCESS_TOKEN:
+        return True
+    auth = request.headers.get("Authorization", "")
+    return auth == f"Bearer {ACCESS_TOKEN}"
+
+
+@app.before_request
+def _auth_middleware():
+    """对所有 /api/ 路由进行 Bearer token 鉴权（首页和静态资源除外）"""
+    if not ACCESS_TOKEN:
+        return None  # 未配置 token 则跳过鉴权
+    if request.path == "/" or not request.path.startswith("/api/"):
+        return None
+    # 文件下载/预览无需鉴权（路径随机，且 <img>/<video> 标签无法携带自定义头）
+    if request.path.startswith("/api/download/"):
+        return None
+    # SSE 和文件下载支持 token=<xxx> 查询参数（EventSource/link 无法设自定义头）
+    token = request.headers.get("Authorization", "")
+    if not token.startswith("Bearer "):
+        token = f"Bearer {request.args.get('token', '')}"
+    if token != f"Bearer {ACCESS_TOKEN}":
+        return jsonify({"error": "未授权，请在设置中配置 Access Token"}), 401
+    return None
+
+
+# ============================================================
 # 会话存储
+# ============================================================
 sessions: dict[str, dict] = {}
 sessions_lock = threading.Lock()
+SESSION_TTL = 3600  # 完成/失败的会话保留 1 小时后清理
+
+
+def _cleanup_sessions():
+    """定期清理过期会话，避免内存泄漏"""
+    while True:
+        time.sleep(300)
+        now = time.time()
+        with sessions_lock:
+            stale = [
+                sid for sid, s in sessions.items()
+                if s.get("cleanup_at", 0) and now > s["cleanup_at"]
+            ]
+            for sid in stale:
+                del sessions[sid]
+
+
+threading.Thread(target=_cleanup_sessions, daemon=True).start()
 
 
 # ============================================================
@@ -57,9 +147,14 @@ class KouboPipeline:
         self.session_dir = OUTPUT_DIR / self.sid
         self.session_dir.mkdir(exist_ok=True)
         self._aborted = False
+        self.step_review = params.get("step_review", False)
+        self._review_event = threading.Event()
+        self._review_action = "approve"
 
     def abort(self):
         self._aborted = True
+        if self.step_review:
+            self._review_event.set()  # 解除审核等待
 
     def emit(self, event: str, data: dict):
         self.q.put(sse_event(event, data))
@@ -78,6 +173,10 @@ class KouboPipeline:
                 "final_url": f"/api/download/{self.sid}/final.mp4",
                 "portrait_url": f"/api/download/{self.sid}/portrait.png",
             })
+            with sessions_lock:
+                if self.sid in sessions:
+                    sessions[self.sid]["status"] = "completed"
+                    sessions[self.sid]["cleanup_at"] = time.time() + SESSION_TTL
         except Exception as e:
             err_msg = str(e)
             self.emit("error", {"message": err_msg})
@@ -85,19 +184,33 @@ class KouboPipeline:
                 if self.sid in sessions:
                     sessions[self.sid]["status"] = "failed"
                     sessions[self.sid]["error"] = err_msg
+                    sessions[self.sid]["cleanup_at"] = time.time() + SESSION_TTL
 
     def _do_run(self):
         # ======== 阶段1: 定妆照 ========
         portrait_url = self.params.get("portrait_url")
         
         if portrait_url and not portrait_url.startswith("/api/download/"):
-            # 外部公网 URL → 直接下载使用
+            if not _is_safe_url(portrait_url):
+                raise ValueError("不允许使用内网或本地地址作为定妆照 URL")
+            # 外部公网 URL → 下载到本地验证格式，但保留原始 URL 给 Seedance
             self.emit("stage", {"stage": "portrait", "step": 1, "total": 3, "label": "🎨 使用已有定妆照"})
-            self.log("使用外部定妆照 URL")
+            self.log("下载外部定妆照...")
             portrait_data = download_with_retry(portrait_url, "定妆照", max_retries=3, timeout=60)
             portrait_path = self.session_dir / "portrait.png"
             portrait_path.write_bytes(portrait_data)
             self.log(f"✅ 下载照片完成 ({len(portrait_data)//1024}KB)")
+            # 验证图片格式（Seedance 只支持 JPEG/PNG）
+            header = portrait_data[:4]
+            if header[:3] == b'\xff\xd8\xff':
+                self.log("   格式: JPEG ✅")
+            elif header[:4] == b'\x89PNG':
+                self.log("   格式: PNG ✅")
+            else:
+                raise RuntimeError(
+                    f"图片格式不支持，请提供 JPEG 或 PNG 格式的图片直链。"
+                    f"当前 URL 返回的文件头为: {header.hex()}（非 JPEG/PNG）"
+                )
             self.emit("portrait_ready", {
                 "url": f"/api/download/{self.sid}/portrait.png",
                 "size_kb": len(portrait_data) // 1024,
@@ -123,9 +236,9 @@ class KouboPipeline:
                     try:
                         test_resp = api_session.get(f"{public_url.rstrip('/')}/api/sessions", timeout=5, verify=False)
                         tunnel_ok = (test_resp.status_code == 200)
-                    except:
+                    except Exception:
                         pass
-                    
+
                     if not tunnel_ok:
                         self.log("⚠️ 公网隧道不可达，本地照片无法被 Seedance 访问")
                         self.emit("error", {
@@ -140,6 +253,7 @@ class KouboPipeline:
                             if self.sid in sessions:
                                 sessions[self.sid]["status"] = "failed"
                                 sessions[self.sid]["error"] = "公网隧道断开，本地照片无法访问"
+                                sessions[self.sid]["cleanup_at"] = time.time() + SESSION_TTL
                         return
                 
                 if public_url:
@@ -174,24 +288,13 @@ class KouboPipeline:
             size = self.params.get("portrait_size", "1440x2560")
             custom_key = self.params.get("api_key", "")
             custom_model = self.params.get("portrait_model", "")
-            use_key = custom_key or ARK_API_KEY
             use_model = custom_model or SEEDREAM_MODEL
 
             self.log(f"调用 Seedream → {size} (model={use_model})")
-            payload = {"model": use_model, "prompt": portrait_prompt, "size": size, "n": 1}
-            if "lite" in use_model:
-                payload["output_format"] = "png"
-            resp = api_session.post(
-                f"{ARK_BASE}/images/generations",
-                headers={"Authorization": f"Bearer {use_key}", "Content-Type": "application/json"},
-                json=payload,
-                timeout=120,
+            portrait_data, portrait_url = generate_portrait_raw(
+                portrait_prompt, size=size,
+                api_key=custom_key, model=custom_model,
             )
-            if resp.status_code != 200:
-                raise RuntimeError(f"定妆照失败 HTTP {resp.status_code}: {resp.text[:300]}")
-
-            portrait_url = resp.json()["data"][0]["url"]
-            portrait_data = download_with_retry(portrait_url, "定妆照", max_retries=3, timeout=60)
             portrait_path = self.session_dir / "portrait.png"
             portrait_path.write_bytes(portrait_data)
             self.log(f"✅ 定妆照完成 ({len(portrait_data)//1024}KB)")
@@ -240,7 +343,7 @@ class KouboPipeline:
                     os.kill(pid, 0)  # check if alive
                     os.kill(pid, 15)  # SIGTERM
                     self.log("🔒 公网隧道已自动关闭（图片已下载完毕）")
-                except:
+                except Exception:
                     pass
         if os.environ.get("KOUBO_PUBLIC_URL") or (OUTPUT_DIR.parent / ".tunnel_url").exists():
             threading.Thread(target=close_tunnel_delayed, daemon=True).start()
@@ -254,7 +357,25 @@ class KouboPipeline:
         ref_url = portrait_url
         video_paths = []
 
-        for i, seg in enumerate(segments):
+        # 断点续传：检查是否有已完成的 checkpoint
+        checkpoint_file = self.session_dir / "checkpoint.json"
+        start_seg = 0
+        if checkpoint_file.exists():
+            try:
+                ck = json.loads(checkpoint_file.read_text())
+                video_paths = ck.get("video_paths", [])
+                ref_url = ck.get("ref_url", ref_url)
+                start_seg = len(video_paths)
+                if start_seg > 0:
+                    self.log(f"📌 从断点恢复，已完成 {start_seg}/{total_segs} 段")
+            except Exception:
+                pass  # checkpoint 损坏则忽略，从头开始
+
+        i = start_seg
+        while i < total_segs:
+            if self._aborted:
+                return
+            seg = segments[i]
             seg_num = i + 1
             seg_dur = seg["duration"]
             self.emit("stage", {"stage": "video", "step": 2, "total": 3, "label": f"🎬 分段视频生成 ({seg_num}/{total_segs})"})
@@ -296,12 +417,12 @@ class KouboPipeline:
             self.log(f"段{seg_num} 任务: {task_id[:30]}...")
 
             # 轮询
-            start = time.time()
-            while time.time() - start < 900:
+            t_start = time.time()
+            while time.time() - t_start < 900:
                 q = api_session.get(f"{ARK_BASE}/contents/generations/tasks/{task_id}", headers=HEADERS, timeout=30)
                 qd = q.json()
                 st = qd.get("status", "?")
-                elapsed = int(time.time() - start)
+                elapsed = int(time.time() - t_start)
                 # 推送进度（0-90% 是等待，最后 10% 是下载）
                 wait_pct = min(90, int(elapsed / 300 * 90)) if elapsed < 300 else 90
                 self.emit("progress", {"segment": seg_num, "total_segments": total_segs, "percent": wait_pct})
@@ -341,40 +462,50 @@ class KouboPipeline:
                             video_paths[idx] = str(vpath)
 
                     ref_url = lf if lf else ref_url
+
+                    # 保存断点（每段完成后更新）
+                    checkpoint_file.write_text(json.dumps({
+                        "video_paths": video_paths,
+                        "ref_url": ref_url,
+                        "total_segments": total_segs,
+                    }))
                     break
                 elif st in ("failed", "expired"):
                     raise RuntimeError(f"段{seg_num} {st}: {qd.get('error', '')}")
                 time.sleep(10)  # 每 10s 轮询
 
+            # ===== 逐段审核：非最后一段时暂停 =====
+            if self.step_review and seg_num < total_segs and not self._aborted:
+                self._review_event.clear()
+                self._review_action = "approve"
+                self.emit("awaiting_review", {
+                    "segment": seg_num,
+                    "total_segments": total_segs,
+                    "video_url": f"/api/download/{self.sid}/seg{seg_num:02d}.mp4",
+                    "size_kb": seg_size,
+                })
+                self.log(f"⏸️ 等待审核段{seg_num}...")
+                self._review_event.wait(timeout=600)
+                if self._aborted:
+                    return
+                if self._review_action == "regenerate":
+                    video_paths.pop()
+                    self.log(f"🔄 用户要求重新生成段{seg_num}")
+                    continue  # 不递增 i，重新生成同一段
+                self.log(f"✅ 段{seg_num} 审核通过，继续下一段")
+
+            i += 1
+
         # ======== 阶段3: 拼接 ========
         if self._aborted: return
+        # 所有分段完成，清除断点
+        checkpoint_file.unlink(missing_ok=True)
+
         self.emit("stage", {"stage": "concat", "step": 3, "total": 3, "label": "🔗 拼接成片"})
         self.log(f"ffmpeg 拼接 {len(video_paths)} 段...")
 
-        concat_list = self.session_dir / "concat.txt"
-        with open(concat_list, "w") as f:
-            for p in video_paths:
-                f.write(f"file '{p}'\n")
-
         self.final_path = self.session_dir / "final.mp4"
-        result = subprocess.run([
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-i", str(concat_list), "-c", "copy", str(self.final_path),
-        ], capture_output=True, text=True)
-        if result.returncode != 0:
-            # fallback 重编码
-            self.log("concat -c copy 失败，尝试重编码...")
-            filter_parts = " ".join([f"[{i}:v][{i}:a]" for i in range(len(video_paths))])
-            filter_str = f"{filter_parts} concat=n={len(video_paths)}:v=1:a=1 [v][a]"
-            cmd2 = ["ffmpeg", "-y"]
-            for p in video_paths:
-                cmd2.extend(["-i", p])
-            cmd2.extend(["-filter_complex", filter_str, "-map", "[v]", "-map", "[a]",
-                         "-c:v", "libx264", "-crf", "23", "-c:a", "aac", "-b:a", "128k",
-                         str(self.final_path)])
-            r2 = subprocess.run(cmd2, capture_output=True, text=True)
-            if r2.returncode != 0:
-                raise RuntimeError(f"拼接失败: {r2.stderr[:500]}")
+        concat_videos(video_paths, str(self.final_path), on_log=self.log)
 
         size_mb = self.final_path.stat().st_size / (1024 * 1024)
         self.log(f"✅ 成片完成 ({size_mb:.1f}MB)")
@@ -566,10 +697,6 @@ def api_preview_split():
 # 在 index 路由之前插入
 @app.route("/")
 def index():
-    template_path = os.path.join(os.path.dirname(__file__), "static", "index.html")
-    if os.path.exists(template_path):
-        with open(template_path, "r", encoding="utf-8") as f:
-            return f.read()
     return render_template_string(HTML_TEMPLATE)
 
 
@@ -620,7 +747,9 @@ def api_smart_segment():
     # 方式2: DeepSeek API 直调
     if not punctuated:
         try:
-            ds_key = "sk-62a850eeede747dea0512a4186570581"
+            ds_key = os.environ.get("DEEPSEEK_API_KEY", "")
+            if not ds_key:
+                raise RuntimeError("未设置 DEEPSEEK_API_KEY 环境变量")
             resp = api_session.post(
                 "https://api.deepseek.com/v1/chat/completions",
                 headers={"Authorization": f"Bearer {ds_key}", "Content-Type": "application/json"},
@@ -693,25 +822,18 @@ def api_preview_portrait():
     )
     
     try:
-        resp = api_session.post(
-            f"{ARK_BASE}/images/generations",
-            headers={"Authorization": f"Bearer {use_key}", "Content-Type": "application/json"},
-            json={"model": use_model, "prompt": portrait_prompt, "size": size, "n": 1, "output_format": "png"},
-            timeout=120,
+        portrait_data, portrait_url = generate_portrait_raw(
+            portrait_prompt, size=size,
+            api_key=custom_key, model=custom_model,
         )
-        if resp.status_code != 200:
-            return jsonify({"error": f"Seedream 失败 HTTP {resp.status_code}: {resp.text[:200]}"}), 500
-        
-        portrait_url = resp.json()["data"][0]["url"]
-        portrait_data = download_with_retry(portrait_url, "定妆照", max_retries=3, timeout=60)
-        
+
         # 保存到 output/preview/ 目录
         preview_dir = OUTPUT_DIR / "previews"
         preview_dir.mkdir(exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         preview_path = preview_dir / f"portrait_{timestamp}.png"
         preview_path.write_bytes(portrait_data)
-        
+
         return jsonify({
             "url": f"/api/download/previews/portrait_{timestamp}.png",
             "direct_url": portrait_url,
@@ -733,6 +855,10 @@ def api_test_connection():
 
     if not api_key:
         return jsonify({"ok": False, "error": "未提供 API Key"})
+
+    # SSRF 防护
+    if not _is_safe_url(api_base):
+        return jsonify({"ok": False, "error": "不允许使用内网地址作为 API 地址"})
 
     results = []
 
@@ -939,7 +1065,7 @@ def api_colloquialize():
     try:
         resp = api_session.post(
             "https://api.deepseek.com/v1/chat/completions",
-            headers={"Authorization": "Bearer sk-62a850eeede747dea0512a4186570581", "Content-Type": "application/json"},
+            headers={"Authorization": f"Bearer {os.environ.get('DEEPSEEK_API_KEY', '')}", "Content-Type": "application/json"},
             json={"model": "deepseek-chat", "messages": [
                 {"role": "system", "content": "你是口播文案改写专家。只输出改写后的文案。"},
                 {"role": "user", "content": prompt}
@@ -948,7 +1074,7 @@ def api_colloquialize():
         )
         if resp.status_code == 200:
             result_text = resp.json()["choices"][0]["message"]["content"].strip()
-    except:
+    except Exception:
         pass
     
     if not result_text:
@@ -1043,7 +1169,7 @@ def api_design_actions():
     try:
         resp = api_session.post(
             "https://api.deepseek.com/v1/chat/completions",
-            headers={"Authorization": "Bearer sk-62a850eeede747dea0512a4186570581", "Content-Type": "application/json"},
+            headers={"Authorization": f"Bearer {os.environ.get('DEEPSEEK_API_KEY', '')}", "Content-Type": "application/json"},
             json={"model": "deepseek-chat", "messages": [
                 {"role": "system", "content": "你是专业口播动作导演。只输出 JSON，不解释。"},
                 {"role": "user", "content": prompt}
@@ -1139,7 +1265,7 @@ def api_start():
         return jsonify({"error": "需要人物描述(character)或上传照片(portrait_url)"}), 400
 
     sid = datetime.now().strftime("%Y%m%d_%H%M%S")
-    q = queue.Queue()
+    q = queue.Queue(maxsize=1000)
 
     params = {
         "character": data.get("character", ""),
@@ -1208,11 +1334,20 @@ def api_status(session_id):
 
 @app.route("/api/download/<session_id>/<filename>")
 def api_download(session_id, filename):
-    # session_id 可能是 "previews" 特殊目录
+    # 安全检查：禁止路径穿越
+    if ".." in session_id or "/" in session_id or "\\" in session_id:
+        return jsonify({"error": "非法路径"}), 400
+    if ".." in filename or "/" in filename or "\\" in filename:
+        return jsonify({"error": "非法路径"}), 400
+
     if session_id == "previews":
-        path = OUTPUT_DIR / "previews" / filename
+        base_dir = OUTPUT_DIR / "previews"
     else:
-        path = OUTPUT_DIR / session_id / filename
+        base_dir = OUTPUT_DIR / session_id
+    path = (base_dir / filename).resolve()
+    # 确保解析后的路径仍在 OUTPUT_DIR 内
+    if not str(path).startswith(str(OUTPUT_DIR.resolve())):
+        return jsonify({"error": "非法路径"}), 403
     if not path.exists():
         return jsonify({"error": "文件不存在"}), 404
     return send_file(str(path), as_attachment=True, download_name=filename)
@@ -1251,7 +1386,7 @@ def api_portraits():
                 ch = pdata.get("character", "")
                 if pu and ch and pu not in project_characters:
                     project_characters[pu] = ch
-            except: pass
+            except Exception: pass
     
     portraits = []
     for f in sorted(previews_dir.glob("*"), reverse=True):
@@ -1300,7 +1435,7 @@ def api_tunnel_restart():
         try:
             old_pid = int(tunnel_pid_file.read_text().strip())
             os.kill(old_pid, 9)
-        except: pass
+        except Exception: pass
         tunnel_pid_file.unlink(missing_ok=True)
     
     # 2. 清旧 URL
@@ -1363,7 +1498,7 @@ def api_tunnel_status():
             # 检查进程是否存在
             os.kill(pid, 0)
             alive = True
-        except: pass
+        except Exception: pass
     
     # 如果 URL 存在且有进程，进一步验证隧道是否可达
     tunnel_ok = False
@@ -1371,7 +1506,7 @@ def api_tunnel_status():
         try:
             test_resp = api_session.get(f"{url.rstrip('/')}/api/sessions", timeout=5, verify=False)
             tunnel_ok = (test_resp.status_code == 200)
-        except: pass
+        except Exception: pass
     
     return jsonify({
         "url": url,
@@ -1404,6 +1539,54 @@ def api_abort(session_id):
             pipeline.abort()
         s["status"] = "aborted"
     return jsonify({"ok": True})
+
+
+# ============================================================
+# 逐段审核 API
+# ============================================================
+@app.route("/api/review/<session_id>/approve", methods=["POST"])
+def api_review_approve(session_id):
+    """审核通过当前段，继续下一段"""
+    with sessions_lock:
+        s = sessions.get(session_id)
+        if not s:
+            return jsonify({"error": "not found"}), 404
+        pipeline = s.get("_pipeline")
+        if not pipeline:
+            return jsonify({"error": "pipeline not running"}), 400
+        pipeline._review_action = "approve"
+        pipeline._review_event.set()
+    return jsonify({"ok": True, "action": "approved"})
+
+
+@app.route("/api/review/<session_id>/regenerate", methods=["POST"])
+def api_review_regenerate(session_id):
+    """重新生成当前段"""
+    with sessions_lock:
+        s = sessions.get(session_id)
+        if not s:
+            return jsonify({"error": "not found"}), 404
+        pipeline = s.get("_pipeline")
+        if not pipeline:
+            return jsonify({"error": "pipeline not running"}), 400
+        pipeline._review_action = "regenerate"
+        pipeline._review_event.set()
+    return jsonify({"ok": True, "action": "regenerate"})
+
+
+@app.route("/api/review/<session_id>/skip_all", methods=["POST"])
+def api_review_skip_all(session_id):
+    """跳过审核，剩余段全部自动完成"""
+    with sessions_lock:
+        s = sessions.get(session_id)
+        if not s:
+            return jsonify({"error": "not found"}), 404
+        pipeline = s.get("_pipeline")
+        if not pipeline:
+            return jsonify({"error": "pipeline not running"}), 400
+        pipeline.step_review = False
+        pipeline._review_event.set()
+    return jsonify({"ok": True, "action": "skip_all"})
 
 
 # ============================================================
@@ -1626,6 +1809,12 @@ button{padding:12px 24px;border:none;border-radius:8px;font-size:14px;font-weigh
               onchange="saveConfig()">
           </div>
           <div>
+            <label style="font-size:11px;color:#8b949e;display:block;margin-bottom:2px">Access Token 🔐</label>
+            <input id="cfg-access-token" type="password" placeholder="不设则无需鉴权"
+              style="width:100%;padding:6px 8px;border:1px solid #30363d;border-radius:4px;background:#0d1117;color:#e1e4e8;font-size:12px;font-family:monospace"
+              onchange="saveAccessToken()">
+          </div>
+          <div>
             <label style="font-size:11px;color:#8b949e;display:block;margin-bottom:2px">API Key</label>
             <input id="cfg-api-key" type="password" placeholder="你的 API 密钥"
               style="width:100%;padding:6px 8px;border:1px solid #30363d;border-radius:4px;background:#0d1117;color:#e1e4e8;font-size:12px;font-family:monospace"
@@ -1738,7 +1927,13 @@ button{padding:12px 24px;border:none;border-radius:8px;font-size:14px;font-weigh
         </select>
       </div>
 
-      <button class="btn-primary" id="btn-start" onclick="startPipeline()">🚀 开始生成</button>
+      <div style="display:flex;align-items:center;gap:16px;margin-top:12px">
+        <button class="btn-primary" id="btn-start" onclick="startPipeline()">🚀 开始生成</button>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:#8b949e;cursor:pointer">
+          <input type="checkbox" id="step-review-mode" style="accent-color:#e74c3c">
+          逐段审核
+        </label>
+      </div>
       <button class="btn-danger hidden" id="btn-cancel" onclick="abortPipeline()">🛑 取消生成</button>
       
       <button class="btn-primary hidden" id="btn-confirm-generate" onclick="startPipeline()" style="margin-top:8px;background:linear-gradient(135deg,#238636,#2ea043)">✅ 确认无误，开始生成</button>
@@ -1812,6 +2007,29 @@ button{padding:12px 24px;border:none;border-radius:8px;font-size:14px;font-weigh
         </div>
       </div>
 
+      <!-- 逐段审核面板（审核模式时显示） -->
+      <div class="hidden" id="review-panel" style="margin-top:12px;padding:16px;background:#161b22;border:1px solid #30363d;border-radius:8px">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+          <span style="font-size:14px;color:#e1e4e8;font-weight:600" id="review-title">🔍 分段 1/3 生成完成</span>
+          <span id="review-size" style="font-size:11px;color:#8b949e"></span>
+        </div>
+        <video id="review-video" controls style="width:100%;max-height:300px;border-radius:6px;background:#0d1117;border:1px solid #30363d" preload="auto"></video>
+        <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
+          <button onclick="reviewAction('approve')" id="btn-approve"
+            style="flex:1;min-width:100px;padding:10px 16px;background:#238636;color:#fff;border:1px solid #2ea043;border-radius:6px;font-size:13px;cursor:pointer;font-weight:600">
+            ✅ 通过，继续
+          </button>
+          <button onclick="reviewAction('regenerate')" id="btn-regenerate"
+            style="flex:1;min-width:100px;padding:10px 16px;background:#21262d;color:#e1e4e8;border:1px solid #30363d;border-radius:6px;font-size:13px;cursor:pointer">
+            🔄 重新生成
+          </button>
+          <button onclick="reviewAction('skip_all')" id="btn-skip-all"
+            style="flex:1;min-width:150px;padding:10px 16px;background:#21262d;color:#8b949e;border:1px solid #30363d;border-radius:6px;font-size:13px;cursor:pointer">
+            ⏩ 跳过审核，自动完成剩余
+          </button>
+        </div>
+      </div>
+
       <!-- 分段视频预览（可折叠） -->
       <div class="hidden" id="segment-preview" style="margin-top:12px">
         <div onclick="document.getElementById('segment-grid').classList.toggle('hidden');var a=document.getElementById('seg-collapse-arrow');a.textContent=a.textContent==='▼'?'▶':'▼'"
@@ -1836,6 +2054,25 @@ button{padding:12px 24px;border:none;border-radius:8px;font-size:14px;font-weigh
 <script>
 let currentSession = null;
 let eventSource = null;
+
+// ===== API 鉴权 =====
+const ACCESS_TOKEN = localStorage.getItem('koubo_access_token') || '__SERVER_TOKEN__';
+const origFetch = window.fetch;
+window.fetch = function(url, opts = {}) {
+  if (ACCESS_TOKEN && !url.toString().startsWith('http')) {
+    opts.headers = opts.headers || {};
+    opts.headers['Authorization'] = 'Bearer ' + ACCESS_TOKEN;
+  }
+  return origFetch.call(this, url, opts);
+};
+
+function promptToken() {
+  const token = prompt('请输入 Access Token（在 .env 中设置的 ACCESS_TOKEN）：', ACCESS_TOKEN);
+  if (token !== null) {
+    localStorage.setItem('koubo_access_token', token.trim());
+    location.reload();
+  }
+}
 
 function addLog(msg, cls) {
   const area = document.getElementById('log-area');
@@ -2012,6 +2249,12 @@ function loadConfig() {
   document.getElementById('cfg-api-base').value = localStorage.getItem('koubo_api_base') || '';
   document.getElementById('cfg-api-key').value = localStorage.getItem('koubo_api_key') || '';
   document.getElementById('cfg-model').value = localStorage.getItem('koubo_model') || '';
+  document.getElementById('cfg-access-token').value = localStorage.getItem('koubo_access_token') || '';
+}
+
+function saveAccessToken() {
+  localStorage.setItem('koubo_access_token', document.getElementById('cfg-access-token').value.trim());
+  location.reload();
 }
 
 async function testConnection() {
@@ -2760,6 +3003,7 @@ async function startPipeline() {
         environment: document.getElementById('environment').value,
         external_tts: document.getElementById('external-tts').checked,
         tts_voice: document.getElementById('tts-voice').value,
+        step_review: document.getElementById('step-review-mode').checked,
       })
     });
     const data = await resp.json();
@@ -2801,6 +3045,32 @@ async function abortPipeline() {
   btn.disabled = false;
   btn.innerHTML = '🛑 取消生成';
   btn.classList.add('hidden');
+}
+
+
+async function reviewAction(action) {
+  if (!currentSession) return;
+  const panel = document.getElementById('review-panel');
+  const buttons = panel.querySelectorAll('button');
+  buttons.forEach(b => { b.disabled = true; });
+
+  const labels = { approve: '✅ 审核通过，继续...', regenerate: '🔄 重新生成中...', skip_all: '⏩ 跳过审核，自动完成...' };
+  addLog(labels[action] || action, 'warn');
+
+  try {
+    const resp = await fetch(`/api/review/${currentSession}/${action}`, { method: 'POST' });
+    const data = await resp.json();
+    if (resp.ok) {
+      panel.classList.add('hidden');
+      document.getElementById('btn-start').parentElement.style.opacity = '1';
+    } else {
+      addLog('❌ 操作失败: ' + (data.error || '未知错误'), 'error');
+      buttons.forEach(b => { b.disabled = false; });
+    }
+  } catch(e) {
+    addLog('❌ 操作失败: ' + e.message, 'error');
+    buttons.forEach(b => { b.disabled = false; });
+  }
 }
 
 
@@ -3049,7 +3319,8 @@ async function runBatchDirect() {
 function connectSSE(sid) {
   if (eventSource) eventSource.close();
 
-  eventSource = new EventSource('/api/events/' + sid);
+  const esUrl = '/api/events/' + sid + (ACCESS_TOKEN ? '?token=' + encodeURIComponent(ACCESS_TOKEN) : '');
+  eventSource = new EventSource(esUrl);
 
   eventSource.addEventListener('log', e => {
     const d = JSON.parse(e.data);
@@ -3109,6 +3380,8 @@ function connectSSE(sid) {
     if (startBtn) { startBtn.disabled = false; startBtn.innerHTML = '🚀 再来一条'; startBtn.classList.remove('hidden'); }
     if (confirmBtn) { confirmBtn.disabled = false; confirmBtn.innerHTML = '✅ 确认无误，开始生成'; }
     document.getElementById('btn-cancel').classList.add('hidden');
+    document.getElementById('review-panel').classList.add('hidden');
+    document.getElementById('btn-start').parentElement.style.opacity = '1';
     addLog('🎉 全部完成！点击下载成片', 'success');
     loadSegments(currentSession);
     eventSource.close();
@@ -3124,17 +3397,22 @@ function connectSSE(sid) {
     } catch(_) {}
     
     if (actionRequired) {
-      // 隧道不可达 → 弹窗让用户选择
+      // 隧道不可达 → 弹窗让用户选择，按钮状态由弹窗选项控制
       document.getElementById('tunnel-error-modal').classList.remove('hidden');
       window._tunnelErrorSession = currentSession;
     } else {
       addLog('❌ ' + msg, 'error');
+      // 非隧道错误：恢复开始按钮
+      document.getElementById('btn-start').classList.remove('hidden');
+      document.getElementById('btn-start').disabled = false;
+      document.getElementById('btn-start').innerHTML = '🚀 开始生成';
+      document.getElementById('btn-confirm-generate').classList.add('hidden');
     }
-    document.getElementById('btn-start').disabled = false;
-    document.getElementById('btn-start').innerHTML = '🚀 开始生成';
     document.getElementById('btn-cancel').classList.add('hidden');
     document.getElementById('segments-overview').classList.remove('hidden');
     document.getElementById('progress-steps').classList.add('hidden');
+    document.getElementById('review-panel').classList.add('hidden');
+    document.getElementById('btn-start').parentElement.style.opacity = '1';
     eventSource.close();
   });
 
@@ -3147,7 +3425,27 @@ function connectSSE(sid) {
     document.getElementById('btn-cancel').classList.add('hidden');
     document.getElementById('segments-overview').classList.remove('hidden');
     document.getElementById('progress-steps').classList.add('hidden');
+    document.getElementById('review-panel').classList.add('hidden');
+    document.getElementById('btn-start').parentElement.style.opacity = '1';
     eventSource.close();
+  });
+
+  eventSource.addEventListener('awaiting_review', e => {
+    const d = JSON.parse(e.data);
+    document.getElementById('review-title').textContent =
+      `🔍 分段 ${d.segment}/${d.total_segments} 生成完成`;
+    document.getElementById('review-size').textContent =
+      d.size_kb ? `(${d.size_kb}KB)` : '';
+    const video = document.getElementById('review-video');
+    video.querySelectorAll('source').forEach(s => s.remove());
+    const src = document.createElement('source');
+    src.src = d.video_url;
+    src.type = 'video/mp4';
+    video.appendChild(src);
+    video.load();
+    document.getElementById('review-panel').classList.remove('hidden');
+    document.getElementById('btn-start').parentElement.style.opacity = '0.5';
+    addLog(`⏸️ 等待审核段${d.segment}...`, 'warn');
   });
 
   eventSource.onerror = () => {
@@ -3241,6 +3539,12 @@ function tunnelSwitchAI() {
   const imgEl = document.getElementById('portrait-preview-img');
   if (imgEl) imgEl.src = '';
   document.getElementById('portrait-preview-area').classList.add('hidden');
+  // 恢复 UI
+  document.getElementById('btn-start').classList.remove('hidden');
+  document.getElementById('btn-start').disabled = false;
+  document.getElementById('btn-start').innerHTML = '🚀 开始生成';
+  document.getElementById('btn-confirm-generate').classList.add('hidden');
+  document.getElementById('btn-cancel').classList.add('hidden');
   addLog('🎨 已切换到 AI 生成模式，将用 Seedream 生成定妆照。请重新点击「开始生成」', 'info');
 }
 
@@ -3252,7 +3556,14 @@ function tunnelManualURL() {
     const imgEl = document.getElementById('portrait-preview-img');
     if (imgEl) { imgEl.src = url; imgEl.style.display = 'block'; }
     document.getElementById('portrait-preview-area').classList.remove('hidden');
-    document.getElementById('portrait-preview-label').textContent = '外部URL';
+    document.getElementById('portrait-preview-label').textContent = '外部URL · ✅ 已确认';
+    document.getElementById('portrait-preview-area').style.border = '2px solid #238636';
+    // 恢复 UI：显示开始按钮，隐藏确认生成按钮
+    document.getElementById('btn-start').classList.remove('hidden');
+    document.getElementById('btn-start').disabled = false;
+    document.getElementById('btn-start').innerHTML = '🚀 开始生成';
+    document.getElementById('btn-confirm-generate').classList.add('hidden');
+    document.getElementById('btn-cancel').classList.add('hidden');
     addLog('🔗 已设置公网 URL，请重新点击「开始生成」', 'success');
   } else if (url) {
     addLog('⚠️ URL 格式不正确，需要以 http 开头', 'error');
@@ -3275,13 +3586,17 @@ setInterval(refreshTunnelStatus, 30000);
     <button onclick="tunnelRetry()" style="width:100%;padding:10px;margin-bottom:8px;background:#238636;color:#fff;border:none;border-radius:6px;font-size:13px;cursor:pointer">① 重启隧道后重试</button>
     <button onclick="tunnelSwitchAI()" style="width:100%;padding:10px;margin-bottom:8px;background:#1a0d33;color:#a371f7;border:1px solid #a371f7;border-radius:6px;font-size:13px;cursor:pointer">② 切换到「🎨 AI生成」模式</button>
     <button onclick="tunnelManualURL()" style="width:100%;padding:10px;margin-bottom:8px;background:#21262d;color:#8b949e;border:1px solid #30363d;border-radius:6px;font-size:13px;cursor:pointer">③ 手动粘贴公网 URL</button>
-    <button onclick="document.getElementById('tunnel-error-modal').classList.add('hidden')" style="width:100%;padding:8px;background:transparent;color:#484f58;border:none;font-size:12px;cursor:pointer">✕ 关闭</button>
+    <button onclick="(function(){document.getElementById('tunnel-error-modal').classList.add('hidden');document.getElementById('btn-start').classList.remove('hidden');document.getElementById('btn-start').disabled=false;document.getElementById('btn-start').innerHTML='🚀 开始生成';document.getElementById('btn-confirm-generate').classList.add('hidden');document.getElementById('btn-cancel').classList.add('hidden');})()" style="width:100%;padding:8px;background:transparent;color:#484f58;border:none;font-size:12px;cursor:pointer">✕ 关闭</button>
   </div>
 </div>
 
 </body>
 </html>
 """
+
+# 将服务器 ACCESS_TOKEN 嵌入前端模板，用户无需手动输入
+if ACCESS_TOKEN:
+    HTML_TEMPLATE = HTML_TEMPLATE.replace('__SERVER_TOKEN__', ACCESS_TOKEN)
 
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 5000

@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
-"""Run segments 2-7 with file-based logging"""
+"""
+[DEPRECATED] 此脚本已废弃。
+用途: 手动逐段轮询已提交的 Seedance 任务并下载视频。
+此功能已整合到 pipeline.py 和 web_server.py 中，仅保留作参考。
+硬编码路径（/home/administrator/videopipe/）和 task ID 不可直接复用。
+"""
+import json
+import time
+import requests
 import json
 import time
 import requests
 import os
 from pathlib import Path
 
-ARK_KEY = os.environ["ARK_API_KEY"]
+ARK_KEY = os.environ.get("ARK_API_KEY", "")
+if not ARK_KEY:
+    raise SystemExit("未设置 ARK_API_KEY 环境变量")
 HEADERS = {"Authorization": f"Bearer {ARK_KEY}", "Content-Type": "application/json"}
 MODEL = "doubao-seedance-1-5-pro-251215"
 BASE = "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks"

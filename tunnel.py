@@ -2,7 +2,7 @@
 """
 公网隧道管理器 — 使用 serveo.net SSH 暴露 localhost:5000
 用法: python3 tunnel.py
-输出: 写入 ~/videopipe/.tunnel_url 文件
+输出: 写入项目根目录 .tunnel_url 文件（与 web_server.py 读取路径一致）
 """
 import subprocess
 import re
@@ -10,8 +10,9 @@ import time
 import sys
 import os
 import atexit
+from pathlib import Path
 
-TUNNEL_FILE = os.path.expanduser("~/videopipe/.tunnel_url")
+TUNNEL_FILE = str(Path(__file__).parent / ".tunnel_url")
 
 def main():
     proc = subprocess.Popen(
@@ -40,8 +41,8 @@ def main():
 
     with open(TUNNEL_FILE, 'w') as f:
         f.write(url)
-    # 写入 PID 供自动关闭使用
-    pid_file = os.path.expanduser("~/videopipe/.tunnel_pid")
+    # 写入 PID 供自动关闭使用（与 web_server.py 读取路径一致）
+    pid_file = str(Path(__file__).parent / ".tunnel_pid")
     with open(pid_file, 'w') as f:
         f.write(str(os.getpid()))
     print(f"\n✅ 公网隧道: {url}")

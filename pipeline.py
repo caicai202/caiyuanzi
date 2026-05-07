@@ -30,7 +30,7 @@ from ark_client import (
     SEEDREAM_MODEL, SEEDANCE_15_PRO, SEEDANCE_2,
     OUTPUT_DIR,
     generate_portrait, create_video_task, wait_for_task,
-    download_with_retry,
+    download_with_retry, concat_videos,
 )
 
 # 默认配置
@@ -49,15 +49,13 @@ def generate_portrait_local(prompt: str, size: str = "1080x1920", n: int = 1):
     print(f"   Prompt: {prompt[:80]}...")
     print(f"   Size: {size}")
 
-    urls, _ = generate_portrait(prompt, size=size, n=n)
-
+    urls, saved_paths = generate_portrait(prompt, size=size, n=n)
     saved = []
-    for i, url in enumerate(urls):
-        img_data = api_session.get(url, timeout=30).content
+    for i, src_path in enumerate(saved_paths):
         path = OUTPUT_DIR / f"{SESSION_ID}_portrait_{i}.png"
-        path.write_bytes(img_data)
+        Path(src_path).rename(path)
         saved.append(str(path))
-        print(f"   ✅ 定妆照 {i+1}: {path} ({len(img_data)//1024}KB)")
+        print(f"   ✅ 定妆照 {i+1}: {path} ({path.stat().st_size//1024}KB)")
 
     return urls, saved
 
@@ -185,46 +183,7 @@ def concat_videos(video_paths: list[str], output_path: str = None) -> str:
     print(f"🔗 阶段3: ffmpeg 拼接 ({len(video_paths)}段)")
 
     # 写 concat 文件列表
-    concat_list_path = str(OUTPUT_DIR / f"{SESSION_ID}_concat.txt")
-    with open(concat_list_path, "w") as f:
-        for p in video_paths:
-            f.write(f"file '{p}'\n")
-
-    # ffmpeg concat
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", concat_list_path,
-        "-c", "copy",
-        output_path,
-    ]
-
-    print(f"   执行: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-
-    if result.returncode != 0:
-        print(f"   ❌ 拼接失败:\n{result.stderr[:1000]}")
-        # 尝试重编码拼接 (fallback)
-        print("   尝试重编码拼接...")
-        filter_parts = []
-        for i, p in enumerate(video_paths):
-            filter_parts.append(f"[{i}:v][{i}:a]")
-        filter_str = " ".join(filter_parts) + f" concat=n={len(video_paths)}:v=1:a=1 [v][a]"
-
-        cmd2 = ["ffmpeg", "-y"]
-        for p in video_paths:
-            cmd2.extend(["-i", p])
-        cmd2.extend([
-            "-filter_complex", filter_str,
-            "-map", "[v]", "-map", "[a]",
-            "-c:v", "libx264", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k",
-            output_path,
-        ])
-        result2 = subprocess.run(cmd2, capture_output=True, text=True)
-        if result2.returncode != 0:
-            raise RuntimeError(f"重编码拼接也失败:\n{result2.stderr[:1000]}")
+    concat_videos(video_paths, output_path)
 
     size_mb = Path(output_path).stat().st_size / (1024 * 1024)
     print(f"   ✅ 成片: {output_path} ({size_mb:.1f}MB)")
